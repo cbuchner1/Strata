@@ -241,6 +241,15 @@ bool intel_i915_gpu() { return strata::intel_gpu_driver() == "i915"; }
 // How long the host waits for a layer's doorbell before it gives the window up (#267).  20 s by default; the first
 // window of a run on a card that JIT-compiles its kernels (no AOT: an Arc A750 needs FP64 emulation) can take longer
 // to start, so STRATA_RING_TIMEOUT_S raises it.
+long strata_window_stall_s() {
+    static const long s = [] {
+        const char* v = std::getenv("STRATA_WINDOW_TIMEOUT_S");
+        const long n = v ? std::atol(v) : 3;
+        return n >= 0 ? n : 3L;
+    }();
+    return s;
+}
+
 std::chrono::seconds strata_ring_timeout() {
     static const long s = [] {
         const char* v = std::getenv("STRATA_RING_TIMEOUT_S");
@@ -793,7 +802,13 @@ bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
     {
         const char* v = std::getenv("STRATA_VERIFY_DEVICE_PLAN");
         // (not with set_always_publish: the device table may lag the host's while windows are in flight)
-        device_plan_ = !all_resident_ && !always_publish_ && (v != nullptr && std::atoi(v) != 0);
+        // With NO_HOST the host can never publish flag A, so the device must plan even when the window looks
+        // all-resident at init: ar_off_ can flip later (a prompt loan, a shrink or a swap) and the doorbell
+        // graph would then run with no publisher.  An explicit STRATA_VERIFY_DEVICE_PLAN=0 still opts out.
+        const int plan_env = v ? std::atoi(v) : -1;                 // -1 unset, 0 off, 1 on
+        const bool no_host = env_on("STRATA_VERIFY_NO_HOST");
+        device_plan_ = (plan_env >= 0 ? plan_env != 0 : no_host)    // explicit env wins, else NO_HOST forces it
+                       && !always_publish_ && (!all_resident_ || no_host);
     }
     // (halo's STRATA_VERIFY_RESIDENT=1 is this window's all_resident_ graph above, which 0.1.39 has on by default)
     if (g_qfuse()) {   // S26: the HC read's q8_1 group counters, zeroed once (each launch leaves them zero)
@@ -865,6 +880,9 @@ const float* Verifier::final_R(int t) const { return R_ + (size_t) t * (size_t) 
 // so the CPU computes A's experts of layer l while the GPU runs B's mixer and router of layer l, and B's experts
 // while the GPU combines A and runs A's layer l+1.  B's mixer only needs A's mixer of the same layer (K/V, GDN
 // state), never A's experts, so nothing waits that did not wait before.  Every token's arithmetic is unchanged.
+// Set once the first window has completed; see the lean condition below.
+static std::atomic<bool> g_first_window_done{false};
+
 bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
     using namespace strata::kernels;
     const ModelGeometry& g = *g_;
@@ -877,7 +895,11 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
     // Not for a batch window (batch_rec_): unless the stage is all-resident, run_slot_rows / batch_poll wait for each
     // layer's doorbell, so a lean batch graph finishes with the ring silent ("verify batch: layer 0 never rang (graph
     // finished)", then the engine dies). Batch windows keep the doorbell nodes; the solo window stays lean.
-    const bool lean = lean_env && no_host_env && device_plan_ && !batch_rec_ && !step_hook_ && !step_hook2_ && !remote_opt_ && !always_publish_ && !g_stepped;
+    // The first window after init must be able to publish: measured on this card a lean first window never
+    // completes (4 tokens at position 0, nothing raised) while the same window non-lean is fine and every later
+    // window is fine lean.  So the first one runs with the doorbell path and the rest keep the lean path.
+    const bool lean = lean_env && no_host_env && device_plan_ && !batch_rec_ && !step_hook_ && !step_hook2_ &&
+                      !remote_opt_ && !always_publish_ && !g_stepped && g_first_window_done.load();
     const WeightTable& wt = *wt_;
     SessionState& ss = *ss_;
     const int64_t N = g.n_embd, HC = g.hc, K = ss.k, C = g.ssm_conv_channels, ZV = g.ssm_value_dim;
@@ -1973,6 +1995,7 @@ bool Verifier::capture(int T, std::string &err) try {
     */
     const dpct::err0 ue = 0;   // no cudaGraphUpload on SYCL: a finalized command_graph is already resident
     const dpct::err0 us = DPCT_CHECK_ERROR(cs_->wait());
+    g_first_window_done.store(true);   // from here on the lean path is allowed
     std::fprintf(
         stderr,
         "strata verify: captured the %d-token window (upload %s, sync %s)\n", T,
@@ -2519,7 +2542,28 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
     // watchdog then releases every verifier's GPU waits (release_live_verifiers) before it ends the engine, so no
     // spin kernel outlives the process.  The wait itself stays a blocking sync (a polling wait cost decode upstream).
     trace_ev("SYNC", -1, -1, 0);
-    const dpct::err0 se = queue_wait_diag(cs_, device_, "window sync");
+    dpct::err0 se = dpct::success;
+    // Bounded sync: an unbounded cs->wait() lets the driver's hangcheck reset the engine before the engine can
+    // report the stall (#267).  STRATA_WINDOW_TIMEOUT_S=0 keeps the old blocking wait.
+    const long stall_s = strata_window_stall_s();
+    if (stall_s > 0) {
+        bool empty = false;
+        const auto deadline = Clock::now() + std::chrono::seconds(stall_s);
+        while (!empty && Clock::now() < deadline) {
+            try { empty = cs_->ext_oneapi_empty(); } catch (...) { empty = true; }   // let wait() report it
+            if (!empty) std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        if (!empty) {
+            std::fprintf(stderr, "strata verify: the window made no progress in %ld s: the GPU is spinning on a flag "
+                                 "nothing can raise (see the diag below)\n", stall_s);
+            trace_ev("STALL", -1, -1, (int64_t) stall_s);
+            diag(stderr);
+            release_gpu_waits(2000);
+            std::fflush(stderr);
+            std::_Exit(2);   // tearing the Level Zero context down here aborts (DEVICE_LOST); as #1980's refused start
+        }
+    }
+    se = queue_wait_diag(cs_, device_, "window sync");
     trace_ev("SYNCED", -1, -1, (int64_t) se);
     const Clock::time_point t_done = Clock::now();
     if (std::getenv("STRATA_VERIFY_DEBUG") != nullptr) {
