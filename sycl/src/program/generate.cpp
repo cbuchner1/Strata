@@ -5308,6 +5308,22 @@ int main(int argc, char **argv) try {
                                      "(%.2f GiB, %.1f s); the GPU reads them over PCIe\n", (long long) got, n_true_miss, miss.size() - n_true_miss,
                              (double) gguf_src.mirrored_bytes() / 1073741824.0,
                              std::chrono::duration<double>(Clock::now() - tm).count());
+
+                // mirror + cache must equal the expert set: an expert in neither tier has no server on this
+                // path (the request report counts cache hits and PCIe reads only), and a window that routes to
+                // one stays finite and is wrong - measured as '!!!!' on UD-IQ1_M at a 16 GiB mirror.  In HOST
+                // mode there is no CPU expert tier to fall back on, so refuse rather than answer wrongly.
+                {
+                    const char* hv = std::getenv("STRATA_VERIFY_NO_HOST");
+                    const bool host_mode = hv != nullptr && hv[0] != '\0' && std::strcmp(hv, "0") != 0;
+                    if (!host_mode && (size_t) got < miss.size()) {
+                        std::fprintf(stderr, "strata generate: REFUSED: %zu of %zu experts are neither in VRAM nor mirrored, "
+                                             "and there is no host expert path to compute them - raise STRATA_MIRROR_MIB or unset it "
+                                             "(auto: MemAvailable - 4 GiB), or set STRATA_VERIFY_NO_HOST=1\n",
+                                     miss.size() - (size_t) got, miss.size());
+                        refuse_exit(2);
+                    }
+                }
                 // the device-built verify plan's view of it: each (layer, expert) -> its mirror address, 0 = none
                 std::vector<unsigned long long> tab((size_t) (g.n_layers * g.n_expert), 0ull);
                 for (int64_t l = 0; l < g.n_layers; ++l)
