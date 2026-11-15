@@ -255,7 +255,11 @@ bool WeightTable::load(const std::string &pack_dir, void *arena_base,
     double upload_ms = 0;
     for (size_t row_i = 0; row_i < rows.size(); ++row_i) {
         const IndexRow& r = rows[row_i];
-        if (skipped[row_i]) {
+        // A row with a shape and no bytes (a native pack's projection that iq_pack left in the GGUF) is an entry
+        // with no arena storage, exactly like a skipped one - only under STRATA_HC_Q8, which is what reads it from there.
+        const bool shape_only = r.code_bits != 0 && r.dst_bytes == 0;
+        const bool q8_native = shape_only && std::getenv("STRATA_HC_Q8") != nullptr;
+        if (skipped[row_i] || q8_native) {
             WeightRef wr;
             wr.data = nullptr;
             wr.resident = false;
@@ -281,11 +285,11 @@ bool WeightTable::load(const std::string &pack_dir, void *arena_base,
             ++report_.tensors;
             continue;
         }
-        if (r.code_bits != 0 && r.dst_bytes == 0) {
-            // plan v0.3 P6: a native pack's row that carries a shape only - the GGUF form must serve it
+        if (shape_only) {
+            // a shape-only row, and nothing here serves it from the GGUF - only that read takes one from there
             err = r.name + ": this pack holds the tensor only in its GGUF form (run with --native SHARD1)";
             sycl::free(stage_in, dpct::get_in_order_queue());
-                sycl::free(stage_out, dpct::get_in_order_queue());
+            sycl::free(stage_out, dpct::get_in_order_queue());
             return false;
         }
         if (r.file != cur_file) {
