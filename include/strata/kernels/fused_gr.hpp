@@ -54,6 +54,10 @@ struct FusedGrArgs {
 };
 
 bool fused_gr_supported(int64_t n_embd, int64_t hc, int64_t hc_lr);
+/// STRATA_HC_Q8: the Q8_0 read's scratch (fused_gr_q8_scratch_floats() floats), device memory,
+/// allocated before any window is captured.
+void fused_gr_set_q8_scratch(float* p);
+size_t fused_gr_q8_scratch_floats();
 /// STRATA_HC_Q8: n int8 codes with one fp32 scale per 32 -> bf16 (the prompt path's GEMMs take bf16).
 void hc_q8_to_bf16(const void* codes, const float* scales, uint16_t* out, long long n, void* stream);
 void fused_gr_read(const FusedGrArgs& a, void* stream);

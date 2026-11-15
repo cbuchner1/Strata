@@ -11,6 +11,7 @@
 #include "strata/sycl_queue.hpp"
 #include "strata/core/emulate.hpp"
 #include "strata/kernels/fused_gr.hpp"
+#include "strata/kernels/q8_block.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 
@@ -451,6 +452,124 @@ bool gr_norm_split() {   // default; STRATA_GR_NORM_SPLIT=0: one work-group per 
 // which fits all eight tokens in one 40 KiB launch and stages 160 chunks of 8 (5 per lane, half the registers held
 // for the weight prefetch); smaller tiles raise how many blocks share an SM (the 41-block grid), e.g. three blocks
 // of four tokens instead of one on sm_75.
+
+// ===================== STRATA_HC_Q8: the down read from the pack's Q8_0 bytes =====================
+// Port of src/kernels/cuda/fused_gr.cu's gr_down_q8_kernel.  Same grid (row group x chunk), same lane map
+// (lanes 8b..8b+7 own one Q8_0 block, 4 values each), same per-(token, chunk, row) partials, so the up kernel
+// and the reduce see exactly the layout they already expect.  The format layer is strata/kernels/q8_block.hpp.
+constexpr int Q8_RPW = 4;                                  // down rows per warp
+constexpr int Q8_RG = LR / (WARPS * Q8_RPW);               // row groups (+1 block: the inject rows)
+constexpr int Q8_KC = 640;                                 // chunk width (Flash-Next: 10240 / 16)
+constexpr int Q8_NKC = D / Q8_KC;                          // 16 chunks
+constexpr int Q8_CPS = N / Q8_KC;                          // chunks per stream
+constexpr int Q8_SPB = Q8_KC / 128;
+constexpr int Q8_PART_PER_TOK = Q8_NKC * (LR + HC);
+constexpr int Q8_SCRATCH_PER_TOK = Q8_PART_PER_TOK + Q8_NKC;                        // 5 steps of 4 blocks
+
+__dpct_inline__ void gr_down_q8_kernel(GrMulti m, uint8_t *dpct_local, float *part, float *ssg) {
+    auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    auto xs = (float *) dpct_local;                        // [kFusedGrMaxT][Q8_KC]
+    auto red = xs + (size_t) kFusedGrMaxT * Q8_KC;         // [WARPS][kFusedGrMaxT]
+    const int t = item.get_local_id(2), lane = t & 31, warp = t >> 5;
+    const int T = m.T;
+    const int rg = (int) item.get_group(2), kc = (int) item.get_group(1), c = kc / Q8_CPS;
+    const bool inj = rg == Q8_RG;
+    const bool inj_bf16 = inj && m.a[0].q8_inject == nullptr;
+    // CUDA: (q8_inject != nullptr || w_inject != nullptr) && warp < HC - a BF16 inject row is still computed,
+    // through the inj_bf16 path below.  Without the `|| w_inject` half the inject rows are never written and the
+    // up read sums zeros (which is exactly what the engine's inject_out showed).
+    const int nrows = inj ? (((m.a[0].q8_inject != nullptr || m.a[0].w_inject != nullptr) && warp < HC) ? 1 : 0)
+                          : Q8_RPW;
+    const int row0 = inj ? warp : (rg * WARPS + warp) * Q8_RPW;
+    const uint8_t *wb = inj ? m.a[0].q8_inject : m.a[0].q8_down;
+    const int sub = lane & 7, bl = lane >> 3;
+
+    uint32_t q[Q8_RPW][Q8_SPB];
+    float dq[Q8_RPW][Q8_SPB];
+    for (int r = 0; r < Q8_RPW; ++r) {
+        if (r >= nrows || inj_bf16) break;
+        const uint8_t *row = wb + (size_t) (row0 + r) * (D / 32) * strata::kernels::q8::kBytes +
+                             (size_t) kc * (Q8_KC / 32) * strata::kernels::q8::kBytes;
+        for (int s = 0; s < Q8_SPB; ++s) {
+            const uint8_t *blk = row + (4 * s + bl) * strata::kernels::q8::kBytes;
+            dq[r][s] = strata::kernels::q8::scale(blk);
+            uint16_t lo, hi;   // CUDA: q8_ld16(blk + 2 + 4*sub) | q8_ld16(blk + 4 + 4*sub) << 16
+            std::memcpy(&lo, blk + 2 + 4 * sub, 2);
+            std::memcpy(&hi, blk + 4 + 4 * sub, 2);
+            q[r][s] = (uint32_t) lo | ((uint32_t) hi << 16);
+        }
+    }
+
+    float ssp[kFusedGrMaxT];
+    for (int k = 0; k < T; ++k) {
+        ssp[k] = 0.0f;
+        const auto &a = m.a[k];
+        const float gw = a.apply ? 2.0f * (1.0f / (1.0f + sycl::exp(-a.inj_prev[c] / (float) HC))) : 0.0f;
+        for (int i = t; i < Q8_KC / 4; i += THREADS) {
+            const int col = kc * Q8_KC + 4 * i;
+            sycl::float4 r = *reinterpret_cast<const sycl::float4 *>(a.R + col);
+            if (a.apply) {
+                const sycl::float4 b = *reinterpret_cast<const sycl::float4 *>(a.bo_prev + (col - c * N));
+                r.x() = std::fma(b.x(), gw, r.x()); r.y() = std::fma(b.y(), gw, r.y());
+                r.z() = std::fma(b.z(), gw, r.z()); r.w() = std::fma(b.w(), gw, r.w());
+            }
+            const sycl::float4 g = *reinterpret_cast<const sycl::float4 *>(a.w_norm + col);
+            ssp[k] += r.x() * r.x() + r.y() * r.y() + r.z() * r.z() + r.w() * r.w();
+            const sycl::float4 xn4(r.x() * g.x(), r.y() * g.y(), r.z() * g.z(), r.w() * g.w());
+            *reinterpret_cast<sycl::float4 *>(&xs[(size_t) k * Q8_KC + 4 * i]) = xn4;
+            // The BF16 read's norm kernel leaves the normalized activation in m.xn and the layer's attention
+            // and FFN consume it from there.  Without this store the window reads whatever the previous step
+            // left behind.
+            if (m.xn != nullptr) *reinterpret_cast<sycl::float4 *>(&m.xn[(size_t) k * D + col]) = xn4;
+        }
+    }
+    for (int k = 0; k < T; ++k) {
+        const float v = warp_sum(ssp[k]);
+        if (lane == 0) red[warp * kFusedGrMaxT + k] = v;
+    }
+    item.barrier();
+    if (rg == 0 && t < T) {
+        float s = 0.0f;
+        for (int w = 0; w < WARPS; ++w) s += red[w * kFusedGrMaxT + t];
+        ssg[(size_t) t * Q8_NKC + kc] = s;
+    }
+    if (nrows == 0) return;
+    for (int r = 0; r < Q8_RPW; ++r) {
+        if (r >= nrows) break;
+        float acc[kFusedGrMaxT];
+        for (int k = 0; k < T; ++k) acc[k] = 0.0f;
+        for (int s = 0; s < Q8_SPB; ++s) {
+            const int v = 32 * (4 * s + bl) + 4 * sub;
+            sycl::float4 w;
+            if (inj_bf16) {
+                uint32_t bx, by;
+                std::memcpy(&bx, m.a[0].w_inject + (size_t) row0 * D + (size_t) kc * Q8_KC + v, 4);
+                std::memcpy(&by, m.a[0].w_inject + (size_t) row0 * D + (size_t) kc * Q8_KC + v + 2, 4);
+                w = sycl::float4(sycl::bit_cast<float>(bx << 16), sycl::bit_cast<float>(bx & 0xffff0000u),
+                                 sycl::bit_cast<float>(by << 16), sycl::bit_cast<float>(by & 0xffff0000u));
+            } else {
+                w = strata::kernels::q8::four(q[r][s], dq[r][s]);
+            }
+            for (int k = 0; k < T; ++k) {
+                const sycl::float4 x = *reinterpret_cast<const sycl::float4 *>(&xs[(size_t) k * Q8_KC + v]);
+                acc[k] = std::fma(w.x(), x.x(), acc[k]); acc[k] = std::fma(w.y(), x.y(), acc[k]);
+                acc[k] = std::fma(w.z(), x.z(), acc[k]); acc[k] = std::fma(w.w(), x.w(), acc[k]);
+            }
+        }
+        const int prow = inj ? LR + warp : row0 + r;
+        for (int k = 0; k < T; ++k) {
+            const float v = warp_sum(acc[k]);
+            if (lane == 0) part[((size_t) k * Q8_NKC + kc) * (LR + HC) + prow] = v;
+        }
+    }
+}
+
+
+
+
+
+
+
 template <int TILEV, int MAX_T = kFusedGrMaxT>
 /*
 DPCT1110: The total declared local variable size in device function
@@ -715,7 +834,113 @@ bool gr_down_direct() {   // default; STRATA_GR_DOWN_DIRECT=0: the tiled kernel 
 }
 
 constexpr int UPM_COLS = 16;                      // columns per block (x 4 streams = 64 rows, 8 per warp)
-constexpr int UPM_BLOCKS = N / UPM_COLS;          // 160
+constexpr int UPM_BLOCKS = N / UPM_COLS;
+// ===================== STRATA_HC_Q8: the up read from the pack's Q8_0 bytes =====================
+// Port of src/kernels/cuda/fused_gr.cu's gr_up_q8_kernel: block x owns UPM_COLS = 16 columns of each of the HC
+// streams (64 output rows), 8 rows per warp.  Lane takes values 4*lane + 128*s, and a row's Q8_0 codes are read
+// as TWO 16-BIT HALVES (q8_ld16(blk+2+off) | q8_ld16(blk+4+off) << 16) - not four bytes at +2 and +6, which is
+// the mistake the down port made before q8_down_parity caught it.
+constexpr int Q8_UPS = (LR + 127) / 128;           // up-row steps of 128 values: 3 at hc_lr 320
+
+__dpct_inline__ void gr_up_q8_kernel(GrMulti m, uint8_t *dpct_local, const float *part, const float *ssg) {
+    auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    float *lo = (float *) dpct_local;                          // [kFusedGrMaxT][LR]
+    float *rsS = lo + (size_t) kFusedGrMaxT * LR;              // [kFusedGrMaxT][HC]
+    float *g = rsS + (size_t) kFusedGrMaxT * HC;               // [kFusedGrMaxT][HC][UPM_COLS]
+    const int t = item.get_local_id(2), lane = t & 31, warp = t >> 5;
+    const int T = m.T;
+    const int d0 = (int) item.get_group(2) * UPM_COLS;
+
+    if (t < T * HC) {
+        const int k = t / HC, c = t - k * HC;
+        float ss = 0.0f;
+        for (int j = 0; j < Q8_CPS; ++j) ss += ssg[(size_t) k * Q8_NKC + c * Q8_CPS + j];
+        const float r = sycl::rsqrt(ss / (float) N + m.a[k].eps);
+        rsS[k * HC + c] = r;
+        if ((int) item.get_group(2) == 0) m.a[k].rs[c] = r;
+    }
+    item.barrier();
+    for (int i = t; i < T * (LR + HC); i += THREADS) {
+        const int k = i / (LR + HC), r = i - k * (LR + HC);
+        if (r >= LR && ((int) item.get_group(2) != 0 || m.a[k].w_inject == nullptr)) continue;
+        float sum = 0.0f;
+        for (int c = 0; c < HC; ++c) {
+            float p = 0.0f;
+            for (int j = 0; j < Q8_CPS; ++j)
+                p += part[((size_t) k * Q8_NKC + c * Q8_CPS + j) * (LR + HC) + r];
+            sum = std::fma(rsS[k * HC + c], p, sum);
+        }
+        if (r < LR) {
+            const float x = sum / (float) HC;
+            lo[(size_t) k * LR + r] = x / (1.0f + sycl::exp(-x));
+        } else {
+            m.a[k].inject_out[r - LR] = sum;
+        }
+    }
+    item.barrier();
+    constexpr int RPW8 = HC * UPM_COLS / WARPS;     // 8 rows per warp
+    for (int qq = 0; qq < RPW8; ++qq) {
+        const int r = warp + qq * WARPS;
+        const int c = r / UPM_COLS, dd = r - c * UPM_COLS, i = c * N + d0 + dd;
+        const uint8_t *row = m.a[0].q8_up + (size_t) i * (LR / 32) * strata::kernels::q8::kBytes;
+        sycl::float4 w[Q8_UPS];
+        for (int s = 0; s < Q8_UPS; ++s) {   // lane: values 4*lane + 128*s (the third step: lanes 0-15)
+            const int v = 4 * lane + 128 * s;
+            if (v < LR) {
+                const uint8_t *blk = row + (v >> 5) * strata::kernels::q8::kBytes;
+                const int off = v & 31;
+                uint16_t lo16, hi16;   // CUDA: q8_ld16(blk + 2 + off) | q8_ld16(blk + 4 + off) << 16
+                std::memcpy(&lo16, blk + 2 + off, 2);
+                std::memcpy(&hi16, blk + 4 + off, 2);
+                w[s] = strata::kernels::q8::four((uint32_t) lo16 | ((uint32_t) hi16 << 16),
+                                                 strata::kernels::q8::scale(blk));
+            } else {
+                w[s] = sycl::float4(0.0f, 0.0f, 0.0f, 0.0f);
+            }
+        }
+        float rv = 0.0f, wn = 0.0f, bo = 0.0f, ip = 0.0f;
+        bool apply = false;
+        if (lane < T) {
+            const auto &a = m.a[lane];
+            rv = a.R[i];
+            wn = a.w_norm[i];
+            apply = a.apply;
+            if (apply) { bo = a.bo_prev[d0 + dd]; ip = a.inj_prev[c]; }
+        }
+        float mine = 0.0f;
+        for (int k = 0; k < T; ++k) {
+            float acc = 0.0f;
+            for (int s = 0; s < Q8_UPS; ++s) {
+                const int v = 4 * lane + 128 * s;
+                if (v < LR) {
+                    const sycl::float4 x = *reinterpret_cast<const sycl::float4 *>(&lo[(size_t) k * LR + v]);
+                    acc = std::fma(w[s].x(), x.x(), acc); acc = std::fma(w[s].y(), x.y(), acc);
+                    acc = std::fma(w[s].z(), x.z(), acc); acc = std::fma(w[s].w(), x.w(), acc);
+                }
+            }
+            acc = warp_sum(acc);
+            if (lane == k) mine = acc;
+        }
+        if (lane < T) {
+            if (apply) {
+                rv = std::fma(bo, 2.0f * (1.0f / (1.0f + sycl::exp(-ip / (float) HC))), rv);
+                m.a[lane].R_out[i] = rv;
+            }
+            const float x = rv * wn * rsS[lane * HC + c];
+            g[((size_t) lane * HC + c) * UPM_COLS + dd] = x * (1.0f / (1.0f + sycl::exp(-mine)));
+        }
+    }
+    item.barrier();
+    for (int i = t; i < T * UPM_COLS; i += THREADS) {
+        const int k = i / UPM_COLS, col = i - k * UPM_COLS;
+        float sum = 0.0f;
+        for (int c = 0; c < HC; ++c) sum += g[((size_t) k * HC + c) * UPM_COLS + col];
+        m.a[k].mixed[d0 + col] = sum / (float) HC;
+    }
+}
+
+
+          // 160
 constexpr int UPM_COLS_MORE = 8;                  // gr_more_groups: 8 columns (32 rows, 4 per warp)
 constexpr int UPM_BLOCKS_MORE = N / UPM_COLS_MORE;   // 320
 
@@ -1818,6 +2043,43 @@ std::atomic<int> g_variant[64];
 
 }  // namespace
 
+static float* g_q8_scratch = nullptr;
+
+// Test entry (q8_down_parity): run the Q8_0 down read alone, without the up kernel or the reduce, so its
+// partials can be checked against a CPU reference over the same weights.
+void gr_down_q8_probe(const strata::kernels::FusedGrArgs *args, int T, float *part, float *ssg, void *stream) try {
+    dpct::queue_ptr q = strata::q_of(stream);
+    GrMulti m{};
+    m.T = T;
+    for (int k = 0; k < T && k < kFusedGrMaxT; ++k) m.a[k] = args[k];
+    const size_t local_bytes = ((size_t) kFusedGrMaxT * Q8_KC + (size_t) WARPS * kFusedGrMaxT) * sizeof(float);
+    q->submit([&](sycl::handler &cgh) {
+         sycl::local_accessor<uint8_t, 1> loc(local_bytes, cgh);
+         cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, Q8_NKC, (Q8_RG + 1) * THREADS),
+                                            sycl::range<3>(1, 1, THREADS)),
+                          [=](sycl::nd_item<3>) { gr_down_q8_kernel(m, loc.get_pointer(), part, ssg); });
+     }).wait();
+}
+catch (sycl::exception const &e) { std::fprintf(stderr, "gr_down_q8_probe: %s\n", e.what()); }
+
+// Test entry (q8_up_parity): the up read alone, with the partials the down read produces.
+void gr_up_q8_probe(const FusedGrArgs *args, int T, const float *part, const float *ssg, void *stream) try {
+    dpct::queue_ptr q = strata::q_of(stream);
+    GrMulti m{};
+    m.T = T;
+    for (int k = 0; k < T && k < kFusedGrMaxT; ++k) m.a[k] = args[k];
+    const size_t local_bytes = ((size_t) kFusedGrMaxT * LR + (size_t) kFusedGrMaxT * HC +
+                                (size_t) kFusedGrMaxT * HC * UPM_COLS) * sizeof(float);
+    q->submit([&](sycl::handler &cgh) {
+         sycl::local_accessor<uint8_t, 1> loc(local_bytes, cgh);
+         cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, UPM_BLOCKS * THREADS),
+                                            sycl::range<3>(1, 1, THREADS)),
+                          [=](sycl::nd_item<3>) { gr_up_q8_kernel(m, loc.get_pointer(), part, ssg); });
+     }).wait();
+}
+catch (sycl::exception const &e) { std::fprintf(stderr, "gr_up_q8_probe: %s\n", e.what()); }
+
+
 // one partials buffer per queue (the verifier's and the drafter's launches never share a queue; within a queue the
 // launches are ordered, and a graph capture records the pointer)
 static float* down_partials(sycl::queue* q) {
@@ -1841,7 +2103,11 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
     for (int t = 0; t < n_tok; ++t) {
         m.a[t] = a[t];
         const FusedGrArgs& x = a[t];
-        if (!x.R || !x.w_norm || !x.w_down || !x.w_up || !x.lo || !x.rs || !x.mixed || (x.w_inject && !x.inject_out) ||
+        // With the Q8_0 read the BF16 projections are not uploaded at all, so they may be null - the check
+        // only has to see the pair the read will actually use.
+        const bool q8_read = a[0].q8_down != nullptr && a[0].q8_up != nullptr;
+        if (!x.R || !x.w_norm || (!q8_read && (!x.w_down || !x.w_up)) || !x.lo || !x.rs || !x.mixed ||
+            (x.w_inject && !x.inject_out) ||
             (x.apply && (!x.bo_prev || !x.inj_prev || !x.R_out)) || x.w_down != a[0].w_down || x.w_up != a[0].w_up ||
             x.w_inject != a[0].w_inject || x.w_norm != a[0].w_norm) {
             std::fprintf(stderr, "fused_gr_read_multi: invalid arguments for token %d\n", t);
@@ -1851,6 +2117,49 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
     m.xn = xn_scratch;
     m.T = n_tok;
     dpct::queue_ptr st = strata::q_of(stream);
+    // STRATA_HC_Q8: the hyper-connection projections are read from the pack's Q8_0 bytes - the GGUF's own
+    // values, 4 bits per weight smaller than the BF16 copies the other read needs.  Takes the place of the BF16
+    // read below, so nothing after this point runs for a Q8 window.  The scratch is the caller's (see
+    // fused_gr_set_q8_scratch): it must be allocated before the window is captured.
+    if (a[0].q8_down != nullptr && a[0].q8_up != nullptr) {
+        float* sc = g_q8_scratch;
+        if (sc == nullptr) {
+            std::fprintf(stderr, "fused_gr_read_multi: the Q8_0 read needs fused_gr_set_q8_scratch\n");
+            std::exit(1);
+        }
+        float* part = sc;
+        float* ssg = sc + (size_t) n_tok * Q8_PART_PER_TOK;
+        const size_t down_local = ((size_t) kFusedGrMaxT * Q8_KC + (size_t) WARPS * kFusedGrMaxT) * sizeof(float);
+        const size_t up_local = ((size_t) kFusedGrMaxT * LR + (size_t) kFusedGrMaxT * HC +
+                                 (size_t) kFusedGrMaxT * HC * UPM_COLS) * sizeof(float);
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
+        if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0, stream);
+        st->submit([&](sycl::handler &cgh) {
+            sycl::local_accessor<uint8_t, 1> loc(down_local, cgh);
+            cgh.parallel_for<dpct_kernel_name<class gr_down_q8_launch>>(
+                sycl::nd_range<3>(sycl::range<3>(1, Q8_NKC, (Q8_RG + 1) * THREADS),
+                                  sycl::range<3>(1, 1, THREADS)),
+                exp_props,
+                [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
+                    gr_down_q8_kernel(m, loc.get_pointer(), part, ssg);
+                });
+        });
+        if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, stream);
+        st->submit([&](sycl::handler &cgh) {
+            sycl::local_accessor<uint8_t, 1> loc(up_local, cgh);
+            cgh.parallel_for<dpct_kernel_name<class gr_up_q8_launch>>(
+                sycl::nd_range<3>(sycl::range<3>(1, 1, UPM_BLOCKS * THREADS),
+                                  sycl::range<3>(1, 1, THREADS)),
+                exp_props,
+                [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
+                    gr_up_q8_kernel(m, loc.get_pointer(), part, ssg);
+                });
+        });
+        // The return value tells the caller whether `mixed`'s q8_1 image was written (STRATA_QFUSE); this
+        // read does not write one, so the caller quantizes as it does for any other read that returns false.
+        return false;
+    }
     // STRATA_GR_V3=1: the two-kernel read above (another summation order - opt-in)
     static const bool v3 = [] { const char* v = std::getenv("STRATA_GR_V3"); return v != nullptr && std::atoi(v) != 0; }();
     static int split3[64] = {};   // per device: 0 = not decided yet, 1 / 2 = column halves S, -1 = does not fit
@@ -2152,8 +2461,13 @@ bool fused_gr_supported(int64_t n_embd, int64_t hc, int64_t hc_lr) {
     return n_embd == N && hc == HC && hc_lr == LR;
 }
 
+/// STRATA_HC_Q8: the Q8_0 read's scratch (fused_gr_q8_scratch_floats() floats), allocated before capture.
+void fused_gr_set_q8_scratch(float* p) { g_q8_scratch = p; }
+size_t fused_gr_q8_scratch_floats() { return (size_t) kFusedGrMaxT * Q8_SCRATCH_PER_TOK; }
+
 void fused_gr_read(const FusedGrArgs& a, void* stream) {
-    if (!a.R || !a.w_norm || !a.w_down || !a.w_up || !a.lo || !a.rs || !a.mixed ||
+    const bool q8_only = a.q8_down != nullptr && a.q8_up != nullptr;
+    if (!a.R || !a.w_norm || (!q8_only && (!a.w_down || !a.w_up)) || !a.lo || !a.rs || !a.mixed ||
         (a.w_inject && !a.inject_out) || (a.apply && (!a.bo_prev || !a.inj_prev || !a.R_out)) ||
         (a.apply && a.inj_prev == a.inject_out)) {
         std::fprintf(stderr, "fused_gr_read: invalid arguments\n");
@@ -2164,7 +2478,7 @@ void fused_gr_read(const FusedGrArgs& a, void* stream) {
     // window's token would differ in its last bits from this kernel's. The header promises "every token's outputs
     // are bitwise fused_gr_read(a[t])" (gr_parity checks it): with those paths on, the single read IS the multi read
     // of one token (each token's sums run in the same order whatever the window size).
-    if (kDownXnTooBig || gr_down_sliced() || gr_norm_split() || gr_down_direct()) {
+    if ((a.q8_down && a.q8_up) || kDownXnTooBig || gr_down_sliced() || gr_norm_split() || gr_down_direct()) {
         static std::mutex mu;
         static std::unordered_map<sycl::queue*, float*> xn;
         float* scratch;

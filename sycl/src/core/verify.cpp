@@ -638,6 +638,11 @@ bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
         mixed_ = b.take<float>(T * N); bo_ = b.take<float>(T * N);
         inj_ = b.take<float>(T * HC); inj2_ = b.take<float>(T * HC);
         lo_ = b.take<float>(T * (uint64_t) g.hc_lr); rs_ = b.take<float>(T * HC); xn_ = b.take<float>(T * HC * N);
+        // STRATA_HC_Q8: the Q8_0 read's partials.  Allocated here, outside any capture - a USM allocation
+        // inside a captured window aborts the engine - and kept out of the bump allocator so the window's fixed
+        // layout is untouched.
+        strata::kernels::fused_gr_set_q8_scratch(
+            sycl::malloc_device<float>(strata::kernels::fused_gr_q8_scratch_floats(), dpct::get_in_order_queue()));
         xq_ = b.take<uint8_t>(strata::kernels::native_q8_1_bytes(max_in, (int) T));
         sh_xq_ = b.take<uint8_t>(strata::kernels::native_q8_1_bytes(max_in, (int) T));
         qkv_L_ = b.take<float>(nG * T * C); h_L_ = b.take<float>(nG * T * C);
