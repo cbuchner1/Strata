@@ -74,8 +74,7 @@ FORM = {
     "ffn_gate_inp.weight": "BF16", "ffn_gate_inp_shexp.weight": "BF16",
     "hc_attn_down.weight": "BF16", "hc_attn_up.weight": "BF16", "hc_attn_inject.weight": "BF16",
     "hc_ffn_down.weight": "BF16", "hc_ffn_up.weight": "BF16", "hc_ffn_inject.weight": "BF16",
-    "output_hc_down.weight": "BF16", "output_hc_up.weight": "BF16",
-    "indexer.k_proj.weight": "BF16", "indexer.q_proj.weight": "BF16",
+    "output_hc_down.weight": "BF16", "output_hc_up.weight": "BF16",    "indexer.k_proj.weight": "BF16", "indexer.q_proj.weight": "BF16",
     "ssm_alpha.weight": "BF16", "ssm_beta.weight": "BF16",
     "ple_key.weight": "BF16", "ple_value.weight": "BF16", "ple_conv1d.weight": "F16",
     "attn_q_norm.weight": "F32", "attn_k_norm.weight": "F32", "hc_attn_norm.weight": "F32",
@@ -84,6 +83,17 @@ FORM = {
     "ple_norm_query.weight": "F32", "ssm_a": "F32", "ssm_conv1d.weight": "F32", "ssm_dt.bias": "F32",
     "ssm_norm.weight": "F32",
 }
+
+# STRATA_HC_Q8=1: the engine reads these projections straight from the GGUF's own Q8_0 bytes, so a Q8_0
+# source stays in the GGUF and is NOT converted into dense.bin - which is where the ~1 GiB of VRAM comes from.
+# Anything else (the F32 inject rows included, which stay BF16) keeps the FORM path above.
+HC_Q8_NATIVE = frozenset({"hc_attn_down.weight", "hc_attn_up.weight", "hc_ffn_down.weight", "hc_ffn_up.weight",
+                          "output_hc_down.weight", "output_hc_up.weight"})
+
+
+def hc_q8_native(name: str, type_name: str) -> bool:
+    """True when the engine reads this projection's Q8_0 bytes itself, so the pack need not carry it."""
+    return type_name == "Q8_0" and any(name == n or name.endswith("." + n) for n in HC_Q8_NATIVE)
 # PLE key encodings left in the GGUF for the engine's native PLE key: the formats NativeDense serves (Q2_0; Q8_0 in
 # UD-Q4_K_XL; IQ3_XXS and IQ4_XS, #381).  Other quantized keys take the BF16 path (--compat-bf16), as before.
 NATIVE_PLE_KEY = {"Q2_0", "Q8_0", "IQ3_XXS", "IQ4_XS"}
@@ -286,7 +296,8 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False) -> int:
         # --compat-bf16 to dequantize - except the native PLE key encodings
         form = form_of(name)
         native = t.type_name not in FLOAT and (form is None or (
-            name == "blk.1.ple_key.weight" and t.type_name in NATIVE_PLE_KEY))
+            name == "blk.1.ple_key.weight" and t.type_name in NATIVE_PLE_KEY) or
+            hc_q8_native(name, t.type_name))
         if t.type_name not in FLOAT and not native and not compat_bf16:
             problems.append(f"{name} is {t.type_name}, but the engine requires {form}; use --compat-bf16")
         todo.append((name, g, t, mm, p, native))

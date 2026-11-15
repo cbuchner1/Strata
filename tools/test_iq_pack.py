@@ -93,6 +93,10 @@ class CompatibilityTests(unittest.TestCase):
             expected = np.array([rounded(x) for x in decoded], dtype=np.uint16)
             for name in names:
                 row = rows[name]
+                if iq_pack.hc_q8_native(name, "Q8_0"):
+                    self.assertEqual(row[2], "0")          # STRATA_HC_Q8: kept in the GGUF, not in dense.bin
+                    self.assertEqual(row[4], "0")
+                    continue
                 self.assertEqual(row[2], "4")
                 offset, size = int(row[3]), int(row[4])
                 np.testing.assert_array_equal(np.frombuffer(dense[offset:offset + size], dtype=np.uint16), expected)
@@ -103,9 +107,10 @@ class CompatibilityTests(unittest.TestCase):
                 self.assertEqual(native[9], "8")
             self.assertNotIn("per_layer_token_embd.weight", rows)
             self.assertEqual(source.read_bytes(), before)
-            self.assertEqual(len(json.loads((root / "compat-bf16.json").read_text())["tensors"]), 6)
+            self.assertEqual(len(json.loads((root / "compat-bf16.json").read_text())["tensors"]), 4)
             conv = json.loads((root / "conversions.json").read_text())
-            self.assertEqual(sorted(r["name"] for r in conv["tensors"]), sorted(names + ["blk.0.ffn_gate_inp.weight"]))
+            expected_conv = [n for n in names if not iq_pack.hc_q8_native(n, "Q8_0")] + ["blk.0.ffn_gate_inp.weight"]
+            self.assertEqual(sorted(r["name"] for r in conv["tensors"]), sorted(expected_conv))
 
     def test_default_still_refuses_inexact_f32_router(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
@@ -129,7 +134,7 @@ class CompatibilityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             root = Path(tmp)
             source = root / "model.gguf"
-            write_gguf(source, [("blk.0.hc_attn_down.weight", np.ones((2, 32), np.float32), Q.Q8_0)])
+            write_gguf(source, [("blk.1.ple_value.weight", np.ones((2, 32), np.float32), Q.Q8_0)])
             (root / "dense.bin").write_bytes(b"previous pack")
             with contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(iq_pack.index_standalone(source, root, iq_pack.Model(source)), 1)
@@ -358,11 +363,14 @@ class ConversionTests(unittest.TestCase):
             self.assertEqual(rc, 1)
             self.assertIn("use --compat-bf16", log)
             self.assertNotIn("ple_key", log)                                      # the Q8_0 key stays native
+            self.assertNotIn("hc_attn_up", log)                                   # STRATA_HC_Q8: the hc projection is native too
             rc, log, rows, dense, conv = pack_one(Path(tmp), tensors, True)
             self.assertEqual(rc, 0, log)
             self.assertEqual(rows["blk.1.ple_key.weight"][2], "0")
+            self.assertEqual(rows["blk.2.hc_attn_up.weight"][2], "0")            # STRATA_HC_Q8: read from the GGUF
+            self.assertEqual(rows["blk.2.hc_attn_up.weight"][4], "0")
             recs = {r["name"]: r for r in conv["tensors"]}
-            self.assertEqual(set(recs), {"blk.1.ple_value.weight", "blk.2.hc_attn_up.weight"})
+            self.assertEqual(set(recs), {"blk.1.ple_value.weight"})
             deq = quants.dequantize(quants.quantize(v, Q.Q8_0), Q.Q8_0).ravel()
             got = (stored(rows, dense, "blk.1.ple_value.weight", "<u2").astype(np.uint32) << 16).view(np.float32)
             r = recs["blk.1.ple_value.weight"]
